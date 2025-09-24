@@ -10,7 +10,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import BinaryIO, Dict, List, Optional, Tuple, Union
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 import zipfile
@@ -338,6 +338,36 @@ def flatten_clauses(clause: Clause, parent: Optional[str] = None, level: int = 1
     return rows
 
 
+def clauses_to_rows(clauses: List[Clause]) -> List[List[str]]:
+    rows: List[List[str]] = [["Clause", "Title", "Parent", "Level", "Text"]]
+    for clause in clauses:
+        rows.extend(flatten_clauses(clause))
+    return rows
+
+
+def extract_pdf_clauses(pdf_path: Union[str, Path]) -> List[Clause]:
+    resolved = Path(pdf_path).expanduser().resolve()
+    if not resolved.exists():
+        raise FileNotFoundError(resolved)
+    try:
+        root = load_pdf_structure(resolved)
+    except subprocess.CalledProcessError:
+        raise
+    lines = extract_lines(root)
+    if not lines:
+        raise ValueError("No text extracted from PDF.")
+    clauses = build_clauses(lines)
+    if not clauses:
+        raise ValueError("No clauses were detected in the document.")
+    return clauses
+
+
+def extract_pdf_data(pdf_path: Union[str, Path]) -> Tuple[List[Clause], List[List[str]]]:
+    clauses = extract_pdf_clauses(pdf_path)
+    rows = clauses_to_rows(clauses)
+    return clauses, rows
+
+
 def column_letter(index: int) -> str:
     result = ""
     while True:
@@ -371,7 +401,7 @@ def build_sheet_xml(rows: List[List[str]]) -> str:
     return "\n".join(xml_lines)
 
 
-def write_xlsx(rows: List[List[str]], output_path: Path) -> None:
+def write_xlsx(rows: List[List[str]], output: Union[Path, BinaryIO]) -> None:
     sheet_xml = build_sheet_xml(rows)
     workbook_xml = """<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
@@ -411,7 +441,14 @@ def write_xlsx(rows: List[List[str]], output_path: Path) -> None:
 </Types>
 """.strip()
 
-    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    if isinstance(output, Path):
+        zip_target = output
+    else:
+        output.seek(0)
+        output.truncate(0)
+        zip_target = output
+
+    with zipfile.ZipFile(zip_target, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("[Content_Types].xml", content_types)
         zf.writestr("_rels/.rels", root_rels)
         zf.writestr("xl/workbook.xml", workbook_xml)
@@ -423,35 +460,24 @@ def write_xlsx(rows: List[List[str]], output_path: Path) -> None:
 def main() -> int:
     args = parse_arguments()
     pdf_path = Path(args.pdf).expanduser().resolve()
-    if not pdf_path.exists():
-        print(f"PDF not found: {pdf_path}", file=sys.stderr)
-        return 1
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        root = load_pdf_structure(pdf_path)
+        clauses, rows = extract_pdf_data(pdf_path)
+    except FileNotFoundError:
+        print(f"PDF not found: {pdf_path}", file=sys.stderr)
+        return 1
     except subprocess.CalledProcessError as exc:
         print(f"Failed to parse PDF with pdftohtml: {exc}", file=sys.stderr)
         return exc.returncode or 1
-
-    lines = extract_lines(root)
-    if not lines:
-        print("No text extracted from PDF.", file=sys.stderr)
-        return 1
-
-    clauses = build_clauses(lines)
-    if not clauses:
-        print("No clauses were detected in the document.", file=sys.stderr)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
         return 1
 
     json_path = output_dir / "clauses.json"
     with json_path.open("w", encoding="utf-8") as handle:
         json.dump([clause.to_dict() for clause in clauses], handle, indent=2)
-
-    rows = [["Clause", "Title", "Parent", "Level", "Text"]]
-    for clause in clauses:
-        rows.extend(flatten_clauses(clause))
 
     xlsx_path = output_dir / "clauses.xlsx"
     write_xlsx(rows, xlsx_path)
