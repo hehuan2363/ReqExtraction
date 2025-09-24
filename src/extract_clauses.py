@@ -6,14 +6,17 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO, Dict, List, Optional, Tuple, Union
-import xml.etree.ElementTree as ET
+from typing import BinaryIO, Dict, Iterable, List, Optional, Tuple, Union
 from xml.sax.saxutils import escape
 import zipfile
+
+from pdfminer.high_level import extract_pages
+from pdfminer.layout import LAParams, LTChar, LTTextContainer, LTTextLine
+from pdfminer.pdfdocument import PDFTextExtractionNotAllowed
+from pdfminer.pdfparser import PDFSyntaxError
 
 
 @dataclass
@@ -152,60 +155,75 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_pdf_structure(pdf_path: Path) -> ET.Element:
-    result = subprocess.run(
-        ["pdftohtml", "-xml", str(pdf_path), "-stdout"],
-        check=True,
-        capture_output=True,
-        text=True,
+def _iter_text_lines(container: LTTextContainer) -> Iterable[LTTextLine]:
+    for element in container:
+        if isinstance(element, LTTextContainer):
+            yield from _iter_text_lines(element)
+        elif isinstance(element, LTTextLine):
+            yield element
+
+
+def _is_bold_font(fontname: Optional[str]) -> bool:
+    if not fontname:
+        return False
+    lowered = fontname.lower()
+    return "bold" in lowered or "black" in lowered or "heavy" in lowered
+
+
+def _text_line_to_line(
+    text_line: LTTextLine,
+    page_number: int,
+    page_height: float,
+) -> Optional[Line]:
+    raw_text = text_line.get_text()
+    if not raw_text:
+        return None
+    cleaned = raw_text.replace("\r", " ").replace("\n", " ").replace("\xa0", " ")
+    if not cleaned.strip():
+        return None
+    lower = cleaned.strip().lower()
+    if lower.startswith("link to page"):
+        return None
+
+    x0, y0, x1, y1 = text_line.bbox
+    top = max(page_height - y1, 0.0)
+    width = max(x1 - x0, 0.0)
+
+    chars = [obj for obj in text_line if isinstance(obj, LTChar)]
+    font_size = max((char.size for char in chars), default=getattr(text_line, "height", 0.0))
+    total_weight = 0
+    bold_weight = 0
+    for char in chars:
+        text = char.get_text()
+        weight = len(text.strip()) or len(text)
+        total_weight += weight
+        if _is_bold_font(getattr(char, "fontname", "")):
+            bold_weight += weight
+    is_bold = total_weight > 0 and (bold_weight / total_weight) >= 0.5
+
+    chunk = TextChunk(
+        page=page_number,
+        top=top,
+        left=float(x0),
+        width=width,
+        text=cleaned.strip("\x00"),
+        font_size=float(font_size),
+        is_bold=is_bold,
     )
-    return ET.fromstring(result.stdout)
+    return Line(page=page_number, top=top, chunks=[chunk])
 
 
-def extract_lines(root: ET.Element) -> List[Line]:
-    font_sizes: Dict[str, float] = {}
-    for fontspec in root.iter("fontspec"):
-        font_sizes[fontspec.get("id")] = float(fontspec.get("size"))
-
+def extract_lines_from_pdf(pdf_path: Path) -> List[Line]:
+    laparams = LAParams(char_margin=1.0, line_margin=0.2, word_margin=0.1)
     lines: List[Line] = []
-    line_merge_threshold = 1.0
-
-    for page in root.findall("page"):
-        page_num = int(page.get("number"))
-        chunks: List[TextChunk] = []
-        for text_elem in page.findall("text"):
-            raw_text = "".join(text_elem.itertext())
-            if not raw_text:
+    for page_number, page_layout in enumerate(extract_pages(str(pdf_path), laparams=laparams), start=1):
+        page_height = float(getattr(page_layout, "height", 0.0))
+        for text_line in _iter_text_lines(page_layout):
+            line = _text_line_to_line(text_line, page_number, page_height)
+            if line is None:
                 continue
-            cleaned = raw_text.replace("\n", " ")
-            if not cleaned.strip():
-                continue
-            lower = cleaned.strip().lower()
-            if lower.startswith("link to page"):
-                continue
-            font_id = text_elem.get("font")
-            font_size = font_sizes.get(font_id, 0.0)
-            attrs = text_elem.attrib
-            chunk = TextChunk(
-                page=page_num,
-                top=float(attrs.get("top", "0")),
-                left=float(attrs.get("left", "0")),
-                width=float(attrs.get("width", "0")),
-                text=cleaned,
-                font_size=font_size,
-                is_bold="<b>" in ET.tostring(text_elem, encoding="unicode").lower(),
-            )
-            chunks.append(chunk)
-        if not chunks:
-            continue
-        chunks.sort(key=lambda c: (c.top, c.left))
-        current_line: Optional[Line] = None
-        for chunk in chunks:
-            if current_line and abs(chunk.top - current_line.top) <= line_merge_threshold:
-                current_line.add_chunk(chunk)
-            else:
-                current_line = Line(page=chunk.page, top=chunk.top, chunks=[chunk])
-                lines.append(current_line)
+            lines.append(line)
+    lines.sort(key=lambda line: (line.page, line.top, line.chunks[0].left if line.chunks else 0.0))
     return lines
 
 
@@ -350,10 +368,11 @@ def extract_pdf_clauses(pdf_path: Union[str, Path]) -> List[Clause]:
     if not resolved.exists():
         raise FileNotFoundError(resolved)
     try:
-        root = load_pdf_structure(resolved)
-    except subprocess.CalledProcessError:
-        raise
-    lines = extract_lines(root)
+        lines = extract_lines_from_pdf(resolved)
+    except PDFTextExtractionNotAllowed as exc:
+        raise PermissionError("Text extraction is not permitted for this PDF.") from exc
+    except PDFSyntaxError as exc:
+        raise ValueError(f"Failed to parse PDF structure: {exc}") from exc
     if not lines:
         raise ValueError("No text extracted from PDF.")
     clauses = build_clauses(lines)
@@ -468,11 +487,14 @@ def main() -> int:
     except FileNotFoundError:
         print(f"PDF not found: {pdf_path}", file=sys.stderr)
         return 1
-    except subprocess.CalledProcessError as exc:
-        print(f"Failed to parse PDF with pdftohtml: {exc}", file=sys.stderr)
-        return exc.returncode or 1
+    except PermissionError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
+        return 1
+    except PDFSyntaxError as exc:
+        print(f"Malformed PDF: {exc}", file=sys.stderr)
         return 1
 
     json_path = output_dir / "clauses.json"
